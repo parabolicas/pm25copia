@@ -1,0 +1,30 @@
+# ============================================================
+# Pipeline PM2.5 — Dependências Python
+# Projeto: PM2.5 e CPNPC — Doutorado Direto FMUSP
+# Python 3.10+
+# ============================================================
+
+# ---- Núcleo científico ----
+numpy>=1.24,<3.0
+pandas>=2.0,<3.0
+scipy>=1.11
+
+# ---- Geoespacial ----
+geopandas>=0.14
+rasterio>=1.3
+shapely>=2.0
+pyproj>=3.6
+
+# ---- Dados em grid (NetCDF) ----
+xarray>=2024.0
+netCDF4>=1.6
+
+# ---- Geocodificação ----
+requests>=2.31    # ViaCEP API
+geopy>=2.4        # Nominatim (OpenStreetMap)
+
+# ---- Visualização ----
+matplotlib>=3.7
+
+# ---- Testes (desenvolvimento) ----
+pytest>=7.4

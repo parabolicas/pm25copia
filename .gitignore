@@ -1,0 +1,38 @@
+# === OS files ===
+.DS_Store
+Thumbs.db
+
+# === Python ===
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# === Large data files & databases ===
+frota_ativa_sp.csv
+sudeste-260213-free.shp.zip
+
+# === Data directories (download separately) ===
+MERRA2/
+CAMS/
+BDQueimadas/
+dados_pm25_cetesb/
+ComposicaoPM25/
+SP_Mesorregioes_2022/
+
+# === Generated output (reproducible from code) ===
+output/
+
+# === Backups ===
+_backup_*/
+_backup_*.py
+
+# === Drafts & temp Word files ===
+rascunhos/
+~$*
+
+# === Geocoder cache ===
+.geocoder_cache.json
+
+# === IDE ===
+.vscode/
+.idea/
