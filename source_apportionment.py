@@ -4,15 +4,25 @@
 source_apportionment.py — Classificação simplificada de fontes de PM2.5
 Projeto: PM2.5 e CPNPC — Doutorado Direto FMUSP
 
+ATUALIZAÇÃO v5: substituição da heurística de áreas (log-frota) por
+ÁREAS OFICIAIS DO IBGE (Censo 2022, BR_Municipios_2022.shp). A heurística
+antiga produzia erros de até 125× para municípios pequenos da RMSP
+(ex: Águas de S. Pedro: 447 km² heurística vs. 3,6 km² IBGE) e ~20×
+de subestimação para São Paulo capital (77 km² heurística vs. 1521 km²
+IBGE). A correção inverte a classificação de vários municípios em
+relação à versão anterior.
+
 Classifica cada município de SP como:
-  - VEICULAR: dominância de emissões veiculares (alta densidade de frota)
-  - BIOMASSA: dominância de queima de biomassa (alta densidade de focos de calor)
+  - VEICULAR: dominância de emissões veiculares (alta diesel/km²)
+  - BIOMASSA: dominância de queima de biomassa (alta focos/km²)
   - MISTA: contribuição relevante de ambas as fontes
+  - BAIXA_EMISSÃO: ambos os índices abaixo do limiar
 
 Metodologia:
-  1. Índice Veicular (IV): veículos diesel por km² do município
-  2. Índice Biomassa (IB): focos de calor acumulados por 1000 km² (2008–2024)
-  3. Classificação por scores padronizados (z-scores)
+  1. Índice Veicular (IV): (diesel + 0.5*pesados) / km²
+  2. Índice Biomassa (IB): focos / 1000 km² / ano
+  3. Padronização robusta (z-score via mediana/MAD)
+  4. Classificação por z-scores e diferenças relativas
 
 Uso:
     python3 source_apportionment.py
@@ -39,85 +49,134 @@ from shapely.geometry import Point
 import config
 
 
-def _normalize_municipio(name):
-    """Normaliza nome de município: remove acentos, caracteres especiais, upper."""
-    if pd.isna(name):
-        return ""
-    s = str(name).upper().strip()
-    # Remove accents via NFD decomposition
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    # Fix broken Latin-1 sequences (e.g. \x89, \x8d)
-    s = re.sub(r'[^A-Z0-9 ]', '', s)
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s
-
-
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
 OUTPUT_DIR = os.path.join(config.OUTPUT_DIR, "source_apportionment")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Limiares para classificação (percentis do z-score)
-# Acima de THRESHOLD_HIGH → fonte dominante
-THRESHOLD_DOMINANT = 0.5  # z-score padronizado
-THRESHOLD_RELEVANT = 0.2  # contribuição relevante
+THRESHOLD_DOMINANT = 0.5
+THRESHOLD_RELEVANT = 0.2
+
+# Aliases para reconciliar grafias entre DETRAN-SP e IBGE.
+# Após normalização estrita (remove acentos + tudo que não é A-Z 0-9),
+# os 7 casos abaixo permanecem com diferença genuína:
+#   - Apóstrofes tratadas diferente ("D'Oeste" vs "Doeste"/"do Oeste")
+#   - Variações Luís/Luiz (S vs Z)
+#   - Diferenças de preposição (DE vs DO)
+#   - Inclusão/omissão de "DO" antes de Aracanguá
+# Todos confirmados via inspeção dos shapefiles oficiais (Mar/2023).
+MUNICIPIO_ALIASES = {
+    # DETRAN_NORM → IBGE_NORM
+    "APARECIDADOOESTE": "APARECIDADOESTE",
+    "BOMSUCESSODOITARARE": "BOMSUCESSODEITARARE",
+    "GUARANIDOOESTE": "GUARANIDOESTE",
+    "LUISIANIA": "LUIZIANIA",
+    "SANTABARBARADOOESTE": "SANTABARBARADOESTE",
+    "SANTOANTONIOARACANGUA": "SANTOANTONIODOARACANGUA",
+    "SAOLUISDOPARAITINGA": "SAOLUIZDOPARAITINGA",
+}
+
+
+def _normalize_municipio(name):
+    """
+    Normalização estrita: maiúsculas + remove acentos + remove tudo que
+    não é A-Z ou 0-9 (apóstrofes, hífens, espaços).
+    """
+    if pd.isna(name):
+        return ""
+    s = str(name).upper().strip()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    return s
+
+
+def _apply_alias(name_norm):
+    """Aplica alias DETRAN→IBGE quando aplicável."""
+    return MUNICIPIO_ALIASES.get(name_norm, name_norm)
 
 
 # ============================================================
-# DADOS DE FROTA
+# CARREGAMENTO DE DADOS
 # ============================================================
+def load_ibge_municipalities():
+    """
+    Carrega o shapefile oficial IBGE (Censo 2022) e filtra UF=SP.
+
+    Returns:
+        GeoDataFrame com colunas:
+          - CD_MUN, NM_MUN, SIGLA_UF (originais IBGE)
+          - AREA_KM2 (área oficial em km², calculada pelo IBGE)
+          - municipio_norm_ibge (nome normalizado para merge)
+          - geometry (polígono em EPSG:4674 SIRGAS 2000)
+          - lon_centroid, lat_centroid (centroides oficiais)
+    """
+    print(f"\n🗺️  Carregando shapefile IBGE de municípios...")
+    print(f"   Arquivo: {os.path.basename(config.MUNICIPIOS_SHP)}")
+    gdf = gpd.read_file(config.MUNICIPIOS_SHP)
+    print(f"   Total Brasil: {len(gdf)} municípios")
+
+    sp = gdf[gdf["SIGLA_UF"] == "SP"].copy()
+    print(f"   ✅ Filtrados {len(sp)} municípios em SP")
+
+    sp["municipio_norm_ibge"] = sp["NM_MUN"].apply(_normalize_municipio)
+
+    # Centroides oficiais (a partir dos polígonos)
+    centroids = sp.geometry.centroid
+    sp["lon_centroid"] = centroids.x
+    sp["lat_centroid"] = centroids.y
+
+    print(f"   Áreas IBGE: min={sp['AREA_KM2'].min():.1f}, "
+          f"max={sp['AREA_KM2'].max():.1f}, "
+          f"mediana={sp['AREA_KM2'].median():.1f} km²")
+    print(f"   Total SP: {sp['AREA_KM2'].sum():.0f} km² "
+          f"(referência IBGE: 248.219 km²)")
+
+    return sp
+
+
 def load_fleet_data():
-    """
-    Carrega e agrega frota por município.
-    Retorna DataFrame com totais por município e indicadores de emissão.
-    """
-    print("🚗 Carregando dados de frota (939 MB)...")
+    """Carrega e agrega frota por município."""
+    print("\n🚗 Carregando dados de frota...")
     cols = ["id_municipio", "municipio", "combustivel", "tipo_veiculo",
             "quantidade_veiculos"]
     df = pd.read_csv(config.FROTA_CSV, usecols=cols)
     print(f"   ✅ {len(df):,} registros, {df['municipio'].nunique()} municípios")
 
-    # Agregar por município
     agg = df.groupby(["id_municipio", "municipio"]).agg(
         total_veiculos=("quantidade_veiculos", "sum"),
     ).reset_index()
 
-    # Diesel (caminhões, ônibus — emissão pesada)
     diesel = df[df["combustivel"] == "DIESEL"].groupby("municipio").agg(
         veiculos_diesel=("quantidade_veiculos", "sum"),
     ).reset_index()
 
-    # Veículos pesados (caminhão + caminhonete + utilitário)
     heavy_types = ["CAMINHAO", "CAMINHONETE", "UTILITARIO"]
     heavy = df[df["tipo_veiculo"].isin(heavy_types)].groupby("municipio").agg(
         veiculos_pesados=("quantidade_veiculos", "sum"),
     ).reset_index()
 
-    # Merge
     fleet = agg.merge(diesel, on="municipio", how="left")
     fleet = fleet.merge(heavy, on="municipio", how="left")
     fleet = fleet.fillna(0)
 
-    # Indicadores
     fleet["pct_diesel"] = (fleet["veiculos_diesel"] / fleet["total_veiculos"] * 100).round(1)
     fleet["pct_pesados"] = (fleet["veiculos_pesados"] / fleet["total_veiculos"] * 100).round(1)
 
     print(f"   📊 Total: {fleet['total_veiculos'].sum():,.0f} veículos, "
           f"{fleet['veiculos_diesel'].sum():,.0f} diesel")
 
+    # Normalização + alias para merge com IBGE
+    fleet["municipio_norm"] = fleet["municipio"].apply(_normalize_municipio)
+    fleet["municipio_norm_ibge"] = fleet["municipio_norm"].apply(_apply_alias)
+
     return fleet
 
 
-# ============================================================
-# DADOS DE QUEIMADAS
-# ============================================================
 def load_all_fires():
-    """
-    Carrega todos os focos de calor (2008–2024) e agrega por município.
-    """
-    print("\n🔥 Carregando focos de calor (BDQueimadas 2008–2024)...")
+    """Carrega todos os focos de calor (BDQueimadas)."""
+    print("\n🔥 Carregando focos de calor (BDQueimadas)...")
 
     all_foci = []
     zip_files = sorted(glob.glob(os.path.join(config.BDQUEIMADAS_DIR, "*.zip")))
@@ -149,115 +208,82 @@ def load_all_fires():
     print(f"   ✅ {len(fires):,} focos totais, "
           f"{fires['municipio'].nunique()} municípios, "
           f"anos {fires['ano'].min()}-{fires['ano'].max()}")
-
     return fires
 
 
 def aggregate_fires_by_municipality(fires):
-    """Agrega focos de calor por município."""
+    """Agrega focos de calor por município (com alias para merge IBGE)."""
     if len(fires) == 0:
         return pd.DataFrame()
 
-    # Total de focos por município (acumulado 2008–2024)
     fire_mun = fires.groupby("municipio").agg(
         total_focos=("lat", "count"),
         n_anos_com_focos=("ano", "nunique"),
-        lat_centroid=("lat", "mean"),
-        lon_centroid=("lon", "mean"),
     ).reset_index()
 
-    # Média anual de focos
     n_years = fires["ano"].nunique()
     fire_mun["focos_por_ano"] = (fire_mun["total_focos"] / n_years).round(1)
+    fire_mun["municipio_norm"] = fire_mun["municipio"].apply(_normalize_municipio)
+    fire_mun["municipio_norm_ibge"] = fire_mun["municipio_norm"].apply(_apply_alias)
 
     return fire_mun
 
 
 # ============================================================
-# ÁREAS DOS MUNICÍPIOS (estimativa via IBGE)
-# ============================================================
-def estimate_municipality_areas(fleet, fire_mun):
-    """
-    Estima área dos municípios usando dados IBGE (via API ou hardcoded).
-    Como fallback, usa a área total de SP dividida proporcionalmente.
-    """
-    # Área total de SP: 248,219 km²
-    SP_AREA_KM2 = 248_219.0
-    n_mun = len(fleet)
-
-    # Usar áreas aproximadas baseadas em dados públicos do IBGE
-    # Para este projeto, usamos a área mediana de SP = ~384 km²/município
-    # e ajustamos pela frota (proxy de urbanização/tamanho)
-    median_area = SP_AREA_KM2 / n_mun
-
-    # Municípios com mais veículos tendem a ser menores em área (urbanos)
-    # Usamos log da frota como proxy inverso de área
-    log_fleet = np.log10(fleet["total_veiculos"] + 1)
-    max_log = log_fleet.max()
-    min_log = log_fleet.min()
-
-    # Municípios grandes (rural): mais frota = menor área
-    # Normalizar: quando log_fleet é alto (urbano), area é baixa
-    # Quando log_fleet é baixo (rural), area é alta
-    norm = (log_fleet - min_log) / (max_log - min_log)  # 0=rural, 1=urbano
-
-    # Área: rural→grande (2x mediana), urbano→pequeno (0.3x mediana)
-    # Isso é uma aproximação, mas funciona para classificação relativa
-    areas = median_area * (2.0 - 1.7 * norm)
-
-    # Ajustar para que o total seja SP_AREA_KM2
-    areas = areas * (SP_AREA_KM2 / areas.sum())
-
-    fleet["area_km2"] = areas.round(1)
-
-    return fleet
-
-
-# ============================================================
 # CLASSIFICAÇÃO
 # ============================================================
-def classify_sources(fleet, fire_mun):
+def classify_sources(fleet, fire_mun, ibge):
     """
-    Classifica cada município como VEICULAR, BIOMASSA ou MISTA.
+    Classifica cada município como VEICULAR, BIOMASSA, MISTA ou BAIXA_EMISSÃO.
 
-    Índices:
-    - IV (Índice Veicular): veículos diesel / km² + pesados / km²
-    - IB (Índice Biomassa): focos / 1000 km² / ano
+    A diferença em relação à versão anterior é o uso de AREAS OFICIAIS DO
+    IBGE (coluna AREA_KM2) em vez da heurística log-frota.
 
-    Classificação:
-    - z_IV > 0.5 e z_IV > z_IB → VEICULAR
-    - z_IB > 0.5 e z_IB > z_IV → BIOMASSA
-    - ambos > 0.2 ou diferença < 0.3 → MISTA
-    - ambos baixos → BAIXA_EMISSÃO
+    Args:
+        fleet: DataFrame com frota por município (com municipio_norm_ibge)
+        fire_mun: DataFrame com focos por município (com municipio_norm_ibge)
+        ibge: GeoDataFrame com 645 municípios SP do IBGE
+
+    Returns:
+        GeoDataFrame com classificação + áreas + geometrias.
     """
-    # Estimar áreas
-    fleet = estimate_municipality_areas(fleet, fire_mun)
+    # Merge frota com IBGE (autoritativo)
+    merged = ibge.merge(fleet, on="municipio_norm_ibge", how="left",
+                        suffixes=("", "_detran"))
 
-    # Normalizar nome do município para merge (strip accents for both sources)
-    fleet["municipio_norm"] = fleet["municipio"].apply(_normalize_municipio)
-
+    # Merge focos
     if len(fire_mun) > 0:
-        fire_mun["municipio_norm"] = fire_mun["municipio"].apply(_normalize_municipio)
-        # Merge
-        merged = fleet.merge(fire_mun[["municipio_norm", "total_focos", "focos_por_ano",
-                                        "lat_centroid", "lon_centroid"]],
-                             on="municipio_norm", how="left")
+        merged = merged.merge(
+            fire_mun[["municipio_norm_ibge", "total_focos", "focos_por_ano"]],
+            on="municipio_norm_ibge", how="left"
+        )
     else:
-        merged = fleet.copy()
         merged["total_focos"] = 0
         merged["focos_por_ano"] = 0
 
-    merged = merged.fillna({"total_focos": 0, "focos_por_ano": 0})
+    # Preencher NaN (municípios sem focos = 0; sem frota = mantém NaN)
+    merged["total_focos"] = merged["total_focos"].fillna(0)
+    merged["focos_por_ano"] = merged["focos_por_ano"].fillna(0)
+    merged["total_veiculos"] = merged["total_veiculos"].fillna(0)
+    merged["veiculos_diesel"] = merged["veiculos_diesel"].fillna(0)
+    merged["veiculos_pesados"] = merged["veiculos_pesados"].fillna(0)
+    merged["pct_diesel"] = merged["pct_diesel"].fillna(0)
+    merged["pct_pesados"] = merged["pct_pesados"].fillna(0)
 
-    # Índice Veicular: diesel/km² + pesados/km² (ponderado)
-    merged["diesel_per_km2"] = merged["veiculos_diesel"] / merged["area_km2"]
-    merged["pesados_per_km2"] = merged["veiculos_pesados"] / merged["area_km2"]
+    # Diagnóstico do match
+    n_with_fleet = (merged["total_veiculos"] > 0).sum()
+    n_with_fires = (merged["total_focos"] > 0).sum()
+    print(f"\n   Match diagnóstico:")
+    print(f"     {n_with_fleet}/{len(merged)} municípios IBGE com dados de frota")
+    print(f"     {n_with_fires}/{len(merged)} municípios IBGE com focos de calor")
+
+    # ÍNDICES (agora usando AREA_KM2 oficial!)
+    merged["diesel_per_km2"] = merged["veiculos_diesel"] / merged["AREA_KM2"]
+    merged["pesados_per_km2"] = merged["veiculos_pesados"] / merged["AREA_KM2"]
     merged["idx_veicular"] = merged["diesel_per_km2"] + 0.5 * merged["pesados_per_km2"]
+    merged["idx_biomassa"] = merged["focos_por_ano"] / merged["AREA_KM2"] * 1000
 
-    # Índice Biomassa: focos/1000km²/ano
-    merged["idx_biomassa"] = merged["focos_por_ano"] / merged["area_km2"] * 1000
-
-    # Padronizar (z-scores robustos — usando mediana e MAD)
+    # z-scores robustos (mediana / MAD)
     for col in ["idx_veicular", "idx_biomassa"]:
         med = merged[col].median()
         mad = np.median(np.abs(merged[col] - med))
@@ -266,12 +292,10 @@ def classify_sources(fleet, fire_mun):
         else:
             merged[f"z_{col.replace('idx_', '')}"] = 0
 
-    # Classificar
     def _classify(row):
         z_v = row["z_veicular"]
         z_b = row["z_biomassa"]
 
-        # Ambos altos → MISTA
         if z_v > THRESHOLD_RELEVANT and z_b > THRESHOLD_RELEVANT:
             if abs(z_v - z_b) < 0.5:
                 return "MISTA"
@@ -280,24 +304,20 @@ def classify_sources(fleet, fire_mun):
             else:
                 return "BIOMASSA_MISTA"
 
-        # Dominância clara
         if z_v > THRESHOLD_DOMINANT and z_b <= THRESHOLD_RELEVANT:
             return "VEICULAR"
         if z_b > THRESHOLD_DOMINANT and z_v <= THRESHOLD_RELEVANT:
             return "BIOMASSA"
 
-        # Low emissão
         if z_v <= THRESHOLD_RELEVANT and z_b <= THRESHOLD_RELEVANT:
             return "BAIXA_EMISSÃO"
 
-        # Outros
         if z_v > z_b:
             return "VEICULAR"
         return "BIOMASSA"
 
     merged["classificacao"] = merged.apply(_classify, axis=1)
 
-    # Simplificar para 3 categorias principais (para análise epidemiológica)
     def _simplify(c):
         if "VEICULAR" in c and "MISTA" not in c:
             return "VEICULAR"
@@ -316,93 +336,67 @@ def classify_sources(fleet, fire_mun):
 # VISUALIZAÇÃO
 # ============================================================
 def plot_classification_map(classified, mesorregioes, output_dir):
-    """Mapa de classificação de fontes por município."""
-    # Criar GeoDataFrame com centróides
-    # Usar centróides das queimadas quando disponível, senão estimar
-    has_coords = classified["lat_centroid"].notna()
-
-    # Para municípios sem focos (sem coordenadas de queimada),
-    # estimar localização usando mesorregião shapefile centroid como fallback
-    if not has_coords.all():
-        # Usar coordenadas médias de SP como fallback genérico
-        classified.loc[~has_coords, "lat_centroid"] = -22.5
-        classified.loc[~has_coords, "lon_centroid"] = -48.5
-
-    geometry = [Point(lon, lat) for lon, lat in
-                zip(classified["lon_centroid"], classified["lat_centroid"])]
-    gdf = gpd.GeoDataFrame(classified, geometry=geometry, crs="EPSG:4326")
-
-    # Cores por fonte
+    """Mapa de classificação por município (agora usando POLÍGONOS reais)."""
     color_map = {
-        "VEICULAR": "#e74c3c",       # vermelho
-        "BIOMASSA": "#f39c12",        # laranja
-        "MISTA": "#9b59b6",           # roxo
-        "BAIXA_EMISSÃO": "#27ae60",   # verde
+        "VEICULAR": "#e74c3c",
+        "BIOMASSA": "#f39c12",
+        "MISTA": "#9b59b6",
+        "BAIXA_EMISSÃO": "#27ae60",
     }
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 
-    # --- Mapa 1: Classificação ---
+    # --- Mapa 1: Polígonos coloridos por classificação ---
     ax1 = axes[0]
     if mesorregioes is not None:
-        mesorregioes.boundary.plot(ax=ax1, linewidth=0.5, color="gray", alpha=0.5)
+        mesorregioes.boundary.plot(ax=ax1, linewidth=0.8, color="black", alpha=0.6)
 
     for fonte, color in color_map.items():
-        subset = gdf[gdf["fonte_principal"] == fonte]
+        subset = classified[classified["fonte_principal"] == fonte]
         if len(subset) > 0:
-            # Tamanho proporcional à frota
-            sizes = np.clip(np.log10(subset["total_veiculos"] + 1) * 5, 5, 80)
-            ax1.scatter(subset.geometry.x, subset.geometry.y,
-                        c=color, s=sizes, alpha=0.6,
-                        edgecolors="black", linewidth=0.2, label=fonte, zorder=3)
+            subset.plot(ax=ax1, color=color, edgecolor="white",
+                        linewidth=0.2, alpha=0.85, label=fonte)
 
     ax1.set_xlim(-54, -44)
     ax1.set_ylim(-26, -19)
-    ax1.set_title("Classificação de Fontes de PM2.5\npor Município — SP",
-                   fontsize=12, fontweight="bold")
+    ax1.set_title("Classificação de Fontes de PM2.5\n"
+                  "por Município — SP (645 municípios, áreas IBGE oficial)",
+                  fontsize=11, fontweight="bold")
     ax1.set_xlabel("Longitude")
     ax1.set_ylabel("Latitude")
     ax1.legend(fontsize=8, loc="lower right",
                title="Fonte Principal", title_fontsize=9)
     ax1.grid(True, alpha=0.2)
 
-    # --- Mapa 2: Índices sobrepostos ---
+    # --- Mapa 2: índice contínuo (escolha: idx_veicular) ---
     ax2 = axes[1]
     if mesorregioes is not None:
-        mesorregioes.boundary.plot(ax=ax2, linewidth=0.5, color="gray", alpha=0.5)
+        mesorregioes.boundary.plot(ax=ax2, linewidth=0.8, color="black", alpha=0.6)
 
-    # Normalizar índices para transparência/cor
-    max_v = classified["idx_veicular"].quantile(0.95)
-    max_b = classified["idx_biomassa"].quantile(0.95)
-
-    # Vetores RGB: Veicular=Red, Biomassa=Orange-Yellow
-    norm_v = np.clip(classified["idx_veicular"] / max_v, 0, 1)
-    norm_b = np.clip(classified["idx_biomassa"] / max_b, 0, 1)
-
-    colors = np.column_stack([
-        np.clip(norm_v * 0.9 + norm_b * 0.3, 0, 1),   # R
-        np.clip(norm_b * 0.6 + norm_v * 0.1, 0, 1),    # G
-        np.clip(norm_v * 0.2, 0, 1),                     # B
-    ])
-
-    ax2.scatter(gdf.geometry.x, gdf.geometry.y,
-                c=colors, s=15, alpha=0.7, edgecolors="none", zorder=3)
+    # Escala log para idx_veicular (varia 0 a milhares)
+    iv = classified["idx_veicular"].copy()
+    vmax = float(np.nanpercentile(iv, 95))  # corta extremos para visualização
+    classified.plot(
+        ax=ax2,
+        column="idx_veicular",
+        cmap="OrRd",
+        vmin=0,
+        vmax=vmax,
+        edgecolor="white",
+        linewidth=0.2,
+        legend=True,
+        legend_kwds={"label": "Diesel + 0.5·pesados / km²",
+                     "orientation": "horizontal",
+                     "shrink": 0.7, "pad": 0.05},
+    )
 
     ax2.set_xlim(-54, -44)
     ax2.set_ylim(-26, -19)
-    ax2.set_title("Intensidade: Veicular (verm.) vs Biomassa (amar.)\npor Município — SP",
-                   fontsize=12, fontweight="bold")
+    ax2.set_title("Intensidade Veicular (diesel + pesados / km²)\n"
+                  "por Município — SP",
+                  fontsize=11, fontweight="bold")
     ax2.set_xlabel("Longitude")
     ax2.grid(True, alpha=0.2)
-
-    # Legend manual
-    legend_elements = [
-        Patch(facecolor="#cc0000", label="Alto veicular"),
-        Patch(facecolor="#cc9900", label="Alto biomassa"),
-        Patch(facecolor="#993300", label="Ambos altos"),
-        Patch(facecolor="#333333", label="Ambos baixos"),
-    ]
-    ax2.legend(handles=legend_elements, fontsize=7, loc="lower right")
 
     plt.tight_layout()
     path = os.path.join(output_dir, "source_classification_map.png")
@@ -412,14 +406,15 @@ def plot_classification_map(classified, mesorregioes, output_dir):
 
 
 def plot_distribution(classified, output_dir):
-    """Gráficos de distribuição dos índices e classificação."""
+    """Gráficos de distribuição."""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    colors_bar = {"VEICULAR": "#e74c3c", "BIOMASSA": "#f39c12",
+                  "MISTA": "#9b59b6", "BAIXA_EMISSÃO": "#27ae60"}
 
     # 1. Histograma de classificação
     ax = axes[0, 0]
     counts = classified["fonte_principal"].value_counts()
-    colors_bar = {"VEICULAR": "#e74c3c", "BIOMASSA": "#f39c12",
-                  "MISTA": "#9b59b6", "BAIXA_EMISSÃO": "#27ae60"}
     bars = ax.bar(counts.index, counts.values,
                   color=[colors_bar.get(c, "gray") for c in counts.index])
     ax.set_title("Distribuição das Classificações", fontweight="bold")
@@ -428,13 +423,13 @@ def plot_distribution(classified, output_dir):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 2,
                 str(val), ha="center", fontsize=9)
 
-    # 2. Scatter: Índice Veicular vs Biomassa
+    # 2. Scatter
     ax = axes[0, 1]
     for fonte, color in colors_bar.items():
         subset = classified[classified["fonte_principal"] == fonte]
         ax.scatter(subset["idx_veicular"], subset["idx_biomassa"],
-                   c=color, alpha=0.5, s=20, label=fonte, edgecolors="white",
-                   linewidth=0.3)
+                   c=color, alpha=0.5, s=20, label=fonte,
+                   edgecolors="white", linewidth=0.3)
     ax.set_xlabel("Índice Veicular (diesel/km²)")
     ax.set_ylabel("Índice Biomassa (focos/1000km²/ano)")
     ax.set_title("Índices: Veicular vs Biomassa", fontweight="bold")
@@ -443,13 +438,12 @@ def plot_distribution(classified, output_dir):
     ax.set_yscale("symlog", linthresh=1)
     ax.grid(True, alpha=0.3)
 
-    # 3. Boxplots por classificação — veículos diesel
+    # 3. Boxplots — diesel
     ax = axes[1, 0]
+    order = ["VEICULAR", "MISTA", "BIOMASSA", "BAIXA_EMISSÃO"]
     data_box = [classified[classified["fonte_principal"] == c]["veiculos_diesel"].values
-                for c in ["VEICULAR", "MISTA", "BIOMASSA", "BAIXA_EMISSÃO"]
-                if c in classified["fonte_principal"].values]
-    labels_box = [c for c in ["VEICULAR", "MISTA", "BIOMASSA", "BAIXA_EMISSÃO"]
-                  if c in classified["fonte_principal"].values]
+                for c in order if c in classified["fonte_principal"].values]
+    labels_box = [c for c in order if c in classified["fonte_principal"].values]
     bp = ax.boxplot(data_box, labels=labels_box, patch_artist=True, showfliers=False)
     for patch, label in zip(bp["boxes"], labels_box):
         patch.set_facecolor(colors_bar.get(label, "gray"))
@@ -459,11 +453,10 @@ def plot_distribution(classified, output_dir):
     ax.set_yscale("symlog", linthresh=100)
     ax.grid(axis="y", alpha=0.3)
 
-    # 4. Boxplots por classificação — focos de calor
+    # 4. Boxplots — focos
     ax = axes[1, 1]
     data_box = [classified[classified["fonte_principal"] == c]["focos_por_ano"].values
-                for c in ["VEICULAR", "MISTA", "BIOMASSA", "BAIXA_EMISSÃO"]
-                if c in classified["fonte_principal"].values]
+                for c in order if c in classified["fonte_principal"].values]
     bp = ax.boxplot(data_box, labels=labels_box, patch_artist=True, showfliers=False)
     for patch, label in zip(bp["boxes"], labels_box):
         patch.set_facecolor(colors_bar.get(label, "gray"))
@@ -473,8 +466,8 @@ def plot_distribution(classified, output_dir):
     ax.set_yscale("symlog", linthresh=1)
     ax.grid(axis="y", alpha=0.3)
 
-    plt.suptitle("Source Apportionment Simplificado — PM2.5 SP\n"
-                 "Classificação por Município (645 municípios)",
+    plt.suptitle("Source Apportionment — PM2.5 SP\n"
+                 "Classificação por Município (645 municípios, áreas IBGE)",
                  fontsize=13, fontweight="bold")
     plt.tight_layout()
     path = os.path.join(output_dir, "source_distribution.png")
@@ -485,18 +478,19 @@ def plot_distribution(classified, output_dir):
 
 def plot_top_municipalities(classified, output_dir):
     """Top 15 municípios por cada índice."""
+    colors_bar = {"VEICULAR": "#e74c3c", "BIOMASSA": "#f39c12",
+                  "MISTA": "#9b59b6", "BAIXA_EMISSÃO": "#27ae60"}
+
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
 
     # Top veicular
     ax = axes[0]
     top_v = classified.nlargest(15, "idx_veicular")
-    colors_v = [{"VEICULAR": "#e74c3c", "BIOMASSA": "#f39c12",
-                 "MISTA": "#9b59b6", "BAIXA_EMISSÃO": "#27ae60"}.get(c, "gray")
-                for c in top_v["fonte_principal"]]
+    colors_v = [colors_bar.get(c, "gray") for c in top_v["fonte_principal"]]
     ax.barh(range(15), top_v["idx_veicular"].values, color=colors_v, alpha=0.8)
     ax.set_yticks(range(15))
-    ax.set_yticklabels([m[:22] for m in top_v["municipio"]], fontsize=8)
-    ax.set_xlabel("Índice Veicular (diesel+pesados / km²)")
+    ax.set_yticklabels([m[:22] for m in top_v["NM_MUN"]], fontsize=8)
+    ax.set_xlabel("Índice Veicular (diesel + 0.5·pesados / km²)")
     ax.set_title("Top 15 — Índice Veicular", fontweight="bold")
     ax.invert_yaxis()
     ax.grid(axis="x", alpha=0.3)
@@ -504,18 +498,16 @@ def plot_top_municipalities(classified, output_dir):
     # Top biomassa
     ax = axes[1]
     top_b = classified.nlargest(15, "idx_biomassa")
-    colors_b = [{"VEICULAR": "#e74c3c", "BIOMASSA": "#f39c12",
-                 "MISTA": "#9b59b6", "BAIXA_EMISSÃO": "#27ae60"}.get(c, "gray")
-                for c in top_b["fonte_principal"]]
+    colors_b = [colors_bar.get(c, "gray") for c in top_b["fonte_principal"]]
     ax.barh(range(15), top_b["idx_biomassa"].values, color=colors_b, alpha=0.8)
     ax.set_yticks(range(15))
-    ax.set_yticklabels([m[:22] for m in top_b["municipio"]], fontsize=8)
+    ax.set_yticklabels([m[:22] for m in top_b["NM_MUN"]], fontsize=8)
     ax.set_xlabel("Índice Biomassa (focos / 1000 km² / ano)")
     ax.set_title("Top 15 — Índice Biomassa", fontweight="bold")
     ax.invert_yaxis()
     ax.grid(axis="x", alpha=0.3)
 
-    plt.suptitle("Municípios com Maior Exposição por Tipo de Fonte",
+    plt.suptitle("Municípios com Maior Exposição por Tipo de Fonte (áreas IBGE)",
                  fontsize=13, fontweight="bold")
     plt.tight_layout()
     path = os.path.join(output_dir, "source_top_municipalities.png")
@@ -525,17 +517,15 @@ def plot_top_municipalities(classified, output_dir):
 
 
 # ============================================================
-# INTEGRAÇÃO COM SUPERFÍCIE PM2.5
+# INTEGRAÇÃO COM PM2.5
 # ============================================================
 def enrich_with_pm25(classified):
-    """
-    Enriquece a tabela com PM2.5 da superfície pré-computada.
-    """
+    """Adiciona PM2.5 (2023) às coordenadas dos centroides oficiais IBGE."""
     try:
         from pm25_surface import lookup_pm25
         pm25_vals = []
         for _, row in classified.iterrows():
-            if pd.notna(row.get("lat_centroid")) and pd.notna(row.get("lon_centroid")):
+            if pd.notna(row["lat_centroid"]) and pd.notna(row["lon_centroid"]):
                 val = lookup_pm25(row["lat_centroid"], row["lon_centroid"], 2023)
                 pm25_vals.append(val)
             else:
@@ -546,7 +536,6 @@ def enrich_with_pm25(classified):
     except Exception as e:
         print(f"  ⚠ Não foi possível carregar PM2.5: {e}")
         classified["pm25_2023"] = None
-
     return classified
 
 
@@ -555,16 +544,18 @@ def enrich_with_pm25(classified):
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🏭 SOURCE APPORTIONMENT SIMPLIFICADO — PM2.5 SP")
+    print("🏭 SOURCE APPORTIONMENT — PM2.5 SP")
     print("   Classificação: Veicular / Biomassa / Mista")
+    print("   Áreas: IBGE Censo 2022 (oficial, BR_Municipios_2022.shp)")
     print("=" * 60)
 
     # 1. Carregar dados
+    ibge = load_ibge_municipalities()
     fleet = load_fleet_data()
     fires = load_all_fires()
     fire_mun = aggregate_fires_by_municipality(fires)
 
-    # 2. Carregar mesorregiões para mapa
+    # 2. Mesorregiões para mapa de fundo
     mesorregioes = None
     try:
         mesorregioes = gpd.read_file(config.MESORREGIOES_SHP)
@@ -576,7 +567,7 @@ def main():
     print("📊 CLASSIFICAÇÃO")
     print("=" * 60)
 
-    classified = classify_sources(fleet, fire_mun)
+    classified = classify_sources(fleet, fire_mun, ibge)
 
     # Tabela resumo
     summary = classified["fonte_principal"].value_counts()
@@ -585,14 +576,15 @@ def main():
         pct = count / len(classified) * 100
         veiculos = classified[classified["fonte_principal"] == fonte]["total_veiculos"].sum()
         focos = classified[classified["fonte_principal"] == fonte]["total_focos"].sum()
-        print(f"    {fonte:15s}: {count:3d} municípios ({pct:5.1f}%) | "
-              f"veículos: {veiculos:>10,.0f} | focos: {focos:>8,.0f}")
+        area = classified[classified["fonte_principal"] == fonte]["AREA_KM2"].sum()
+        print(f"    {fonte:15s}: {count:3d} mun. ({pct:5.1f}%) | "
+              f"área={area:>8.0f} km² | "
+              f"veíc={veiculos:>10,.0f} | focos={focos:>8,.0f}")
 
     # 4. Enriquecer com PM2.5
-    print("\n📡 Adicionando dados de PM2.5 (superfície 2023)...")
+    print("\n📡 Adicionando PM2.5 (superfície 2023)...")
     classified = enrich_with_pm25(classified)
 
-    # PM2.5 médio por classificação
     if classified["pm25_2023"].notna().any():
         print("\n  PM2.5 médio (2023) por classificação:")
         for fonte in ["VEICULAR", "MISTA", "BIOMASSA", "BAIXA_EMISSÃO"]:
@@ -601,24 +593,39 @@ def main():
             if len(subset) > 0:
                 mean_pm = subset["pm25_2023"].mean()
                 std_pm = subset["pm25_2023"].std()
-                print(f"    {fonte:15s}: {mean_pm:.1f} ± {std_pm:.1f} µg/m³ (n={len(subset)})")
+                print(f"    {fonte:15s}: {mean_pm:.1f} ± {std_pm:.1f} µg/m³ "
+                      f"(n={len(subset)})")
 
     # 5. Salvar resultados
     print("\n" + "=" * 60)
     print("💾 SALVANDO RESULTADOS")
     print("=" * 60)
 
-    # CSV completo
-    out_cols = ["id_municipio", "municipio", "total_veiculos", "veiculos_diesel",
-                "veiculos_pesados", "pct_diesel", "pct_pesados", "area_km2",
-                "total_focos", "focos_por_ano", "diesel_per_km2", "pesados_per_km2",
-                "idx_veicular", "idx_biomassa", "z_veicular", "z_biomassa",
-                "classificacao", "fonte_principal", "pm25_2023",
+    out_cols = ["CD_MUN", "NM_MUN", "SIGLA_UF", "AREA_KM2",
+                "id_municipio", "municipio",
+                "total_veiculos", "veiculos_diesel", "veiculos_pesados",
+                "pct_diesel", "pct_pesados",
+                "total_focos", "focos_por_ano",
+                "diesel_per_km2", "pesados_per_km2",
+                "idx_veicular", "idx_biomassa",
+                "z_veicular", "z_biomassa",
+                "classificacao", "fonte_principal",
+                "pm25_2023",
                 "lat_centroid", "lon_centroid"]
     out_cols = [c for c in out_cols if c in classified.columns]
     csv_path = os.path.join(OUTPUT_DIR, "source_apportionment_municipalities.csv")
     classified[out_cols].to_csv(csv_path, index=False)
     print(f"  📄 CSV completo: {csv_path}")
+
+    # GeoPackage com polígonos (formato moderno, abre em QGIS)
+    try:
+        gpkg_path = os.path.join(OUTPUT_DIR, "source_apportionment_municipalities.gpkg")
+        cols_gpkg = out_cols + ["geometry"]
+        cols_gpkg = [c for c in cols_gpkg if c in classified.columns]
+        classified[cols_gpkg].to_file(gpkg_path, driver="GPKG")
+        print(f"  📄 GeoPackage (polígonos): {gpkg_path}")
+    except Exception as e:
+        print(f"  ⚠ Não foi possível salvar GeoPackage: {e}")
 
     # 6. Visualizações
     print("\n" + "=" * 60)
@@ -629,35 +636,32 @@ def main():
     plot_distribution(classified, OUTPUT_DIR)
     plot_top_municipalities(classified, OUTPUT_DIR)
 
-    # 7. Exemplos para os 5 pacientes-modelo
+    # 7. Pacientes-modelo
     print("\n" + "=" * 60)
     print("🔬 CLASSIFICAÇÃO DOS MUNICÍPIOS DOS PACIENTES-MODELO")
     print("=" * 60)
 
     test_cities = {
-        "PAC_01": "SAO PAULO",
-        "PAC_02a": "CAMPINAS",
-        "PAC_02b": "SAO PAULO",
-        "PAC_03": "SAO JOSE DO RIO PRETO",
-        "PAC_04": "ITAI",
-        "PAC_05": "SANTOS",
+        "PAC_01": "São Paulo",
+        "PAC_02a": "Campinas",
+        "PAC_02b": "São Paulo",
+        "PAC_03": "São José do Rio Preto",
+        "PAC_04": "Itaí",
+        "PAC_05": "Santos",
     }
 
     for pac_id, city in test_cities.items():
-        match = classified[classified["municipio_norm"] == city]
+        city_norm = _apply_alias(_normalize_municipio(city))
+        match = classified[classified["municipio_norm_ibge"] == city_norm]
         if len(match) > 0:
             row = match.iloc[0]
-            pm25_str = f", PM2.5={row['pm25_2023']:.1f}" if pd.notna(row.get("pm25_2023")) else ""
-            print(f"  {pac_id}: {city:25s} → {row['fonte_principal']:15s} "
-                  f"(IV={row['idx_veicular']:.1f}, IB={row['idx_biomassa']:.1f}{pm25_str})")
+            pm25_str = (f", PM2.5={row['pm25_2023']:.1f}"
+                        if pd.notna(row.get("pm25_2023")) else "")
+            print(f"  {pac_id}: {row['NM_MUN']:25s} → {row['fonte_principal']:15s} "
+                  f"(área={row['AREA_KM2']:.1f} km², "
+                  f"IV={row['idx_veicular']:.2f}, IB={row['idx_biomassa']:.2f}{pm25_str})")
         else:
-            # Fuzzy match
-            candidates = classified[classified["municipio_norm"].str.contains(city.split()[0])]
-            if len(candidates) > 0:
-                row = candidates.iloc[0]
-                print(f"  {pac_id}: {row['municipio']:25s} → {row['fonte_principal']:15s}")
-            else:
-                print(f"  {pac_id}: {city:25s} → NÃO ENCONTRADO")
+            print(f"  {pac_id}: {city:25s} → NÃO ENCONTRADO")
 
     print("\n" + "=" * 60)
     print("✅ SOURCE APPORTIONMENT COMPLETO!")

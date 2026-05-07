@@ -28,6 +28,10 @@ MERRA2_DIR = os.path.join(BASE_DIR, "MERRA2")
 BDQUEIMADAS_DIR = os.path.join(BASE_DIR, "BDQueimadas")
 MESORREGIOES_SHP = os.path.join(BASE_DIR, "SP_Mesorregioes_2022",
                                  "SP_Mesorregioes_2022.shp")
+# Shapefile oficial IBGE (Censo 2022) — fonte autoritativa de áreas
+# municipais. Usado por source_apportionment.py.
+MUNICIPIOS_SHP = os.path.join(BASE_DIR, "BR_Municipios_2022",
+                               "BR_Municipios_2022.shp")
 FROTA_CSV = os.path.join(BASE_DIR, "frota_ativa_sp.csv")
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
@@ -53,9 +57,6 @@ MERRA2_FORMULA = {
 # ============================================================
 # PACIENTES-MODELO
 # ============================================================
-# Cada residência pode usar:
-#   - date_start / date_end ("AAAA-MM-DD"): ponderação diária precisa
-#   - year_start / year_end (int): equivale a 01/jan e 31/dez do ano
 TEST_PATIENTS = [
     {
         "id": "PAC_01",
@@ -70,11 +71,9 @@ TEST_PATIENTS = [
         "id": "PAC_02",
         "name": "Paciente Campinas → SP (multi-endereço, mudança em meio de ano)",
         "residences": [
-            # Campinas: 2012-01-01 a 2017-06-30 → 2017 conta com fração 181/365
             {"cep": "13083-970", "lat": -22.8168, "lon": -47.0688,
              "city": "Campinas",
              "date_start": "2012-01-01", "date_end": "2017-06-30"},
-            # SP: 2017-07-01 a 2024-12-31 → 2017 conta com fração 184/365
             {"cep": "01310-100", "lat": -23.5636, "lon": -46.6544,
              "city": "São Paulo",
              "date_start": "2017-07-01", "date_end": "2024-12-31"},
@@ -93,7 +92,6 @@ TEST_PATIENTS = [
         "id": "PAC_04",
         "name": "Paciente Itaí – Rural/Queimadas",
         "residences": [
-            # CEP 18730-003: Avenida Santo Antônio, Centro, Itaí/SP
             {"cep": "18730-003", "lat": -23.4183, "lon": -49.0917,
              "city": "Itaí",
              "date_start": "2010-01-01", "date_end": "2024-12-31"},
