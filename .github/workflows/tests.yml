@@ -1,0 +1,121 @@
+# =============================================================
+# GitHub Actions — CI/CD pipeline
+# Projeto: PM2.5 e CPNPC — Doutorado Direto FMUSP
+#
+# Roda os 26 testes pytest a cada push/pull-request em três
+# versões do Python (3.10, 3.11, 3.12) sobre Ubuntu Linux.
+#
+# Tempo médio de execução por job: ~60-90 segundos
+#   (instalação de GDAL e libs C é ~30s; pytest puro <2s)
+#
+# Badge para README:
+#   ![tests](https://github.com/parabolicas/pm25/actions/workflows/tests.yml/badge.svg)
+# =============================================================
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  # Permite disparar manualmente do botão "Run workflow"
+  workflow_dispatch:
+
+# Cancela jobs antigos do mesmo branch quando há novo push
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Não cancela todos os jobs se um falhar — útil para ver
+      # se a falha é específica de uma versão de Python.
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      # ---------------------------------------------------------
+      # 1. Checkout do código (com fetch-depth=1 para velocidade)
+      # ---------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------
+      # 2. Setup Python com cache de pip
+      # ---------------------------------------------------------
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+
+      # ---------------------------------------------------------
+      # 3. Bibliotecas C do sistema (GDAL para rasterio/geopandas;
+      #    netCDF para xarray/MERRA-2)
+      # ---------------------------------------------------------
+      - name: Install system dependencies (GDAL, NetCDF)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgdal-dev \
+            gdal-bin \
+            libnetcdf-dev \
+            libgeos-dev \
+            libproj-dev \
+            proj-data \
+            proj-bin
+
+      # ---------------------------------------------------------
+      # 4. Dependências Python (do requirements.txt do projeto)
+      # ---------------------------------------------------------
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install -r requirements.txt
+
+      # ---------------------------------------------------------
+      # 5. Imprimir info do ambiente (útil para debug em falhas)
+      # ---------------------------------------------------------
+      - name: Show environment info
+        run: |
+          echo "=== Python ==="
+          python --version
+          echo ""
+          echo "=== Key packages ==="
+          pip list | grep -E "numpy|pandas|geopandas|xarray|rasterio|scipy|geopy|requests|pytest"
+          echo ""
+          echo "=== GDAL ==="
+          gdalinfo --version
+
+      # ---------------------------------------------------------
+      # 6. Roda os 26 testes pytest
+      #    -v : verbose (mostra cada teste)
+      #    --tb=short : traceback compacto se falhar
+      #    --color=yes : cores no log do GitHub
+      #    --strict-markers : falha se houver marker indefinido
+      # ---------------------------------------------------------
+      - name: Run pytest
+        run: |
+          python -m pytest -v --tb=short --color=yes --strict-markers
+
+      # ---------------------------------------------------------
+      # 7. Em caso de falha, sobe o cache do pytest como artefato
+      #    para inspeção posterior (acessível na aba Actions).
+      # ---------------------------------------------------------
+      - name: Upload pytest cache (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-cache-py${{ matrix.python-version }}
+          path: |
+            .pytest_cache/
+            output/validation_report.txt
+          retention-days: 7
+          if-no-files-found: ignore
