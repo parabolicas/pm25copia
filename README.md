@@ -233,4 +233,4 @@ Faculdade de Medicina, Universidade de São Paulo
 
 ## Licença
 
-A definir. Sugerido: MIT (código) + CC-BY-4.0 (dados derivados).
+Este projeto é licenciado sob a [MIT License](LICENSE).

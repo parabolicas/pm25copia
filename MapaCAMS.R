@@ -202,4 +202,4 @@ for (c in cidades) {
   cat(sprintf("  %-18s: %.1f µg/m³\n", c[1], val))
 }
 
-nc_close(nc) 
+nc_close(nc)

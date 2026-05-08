@@ -1,0 +1,39 @@
+# =============================================================
+# Pre-commit hooks — PM2.5 e CPNPC
+#
+# Rodam automaticamente antes de cada `git commit`.
+# Se pytest falhar, o commit é bloqueado.
+#
+# Instalação (uma vez):
+#   pre-commit install
+#
+# Rodar manualmente em todos os arquivos:
+#   pre-commit run --all-files
+# =============================================================
+
+repos:
+  # ----------------------------------------------------------
+  # Hooks padrão: trailing whitespace, EOF, YAML syntax, etc.
+  # ----------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=5000']   # bloqueia arquivos >5 MB
+
+  # ----------------------------------------------------------
+  # Pytest local — roda os 26 testes antes de cada commit
+  # ----------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: .venv/bin/python -m pytest -v --tb=short
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
