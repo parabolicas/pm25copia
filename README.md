@@ -1,6 +1,6 @@
 # pm25-cpnpc
 
-[![tests](https://github.com/parabolicas/pm25/actions/workflows/tests.yml/badge.svg)](https://github.com/parabolicas/pm25/actions/workflows/tests.yml)
+[![tests](https://github.com/parabolicas/pm25copia/actions/workflows/tests.yml/badge.svg)](https://github.com/parabolicas/pm25copia/actions/workflows/tests.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -222,7 +222,7 @@ Quando este pipeline for usado, cite:
   title        = {pm25-cpnpc: pipeline geoespacial para exposição cumulativa
                   ao PM2.5 em estudos de epidemiologia oncológica},
   year         = {2026},
-  howpublished = {\url{https://github.com/parabolicas/pm25}},
+  howpublished = {\url{https://github.com/parabolicas/pm25copia}},
 }
 ```
 

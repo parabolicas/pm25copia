@@ -9,7 +9,7 @@
 #   (instalação de GDAL e libs C é ~30s; pytest puro <2s)
 #
 # Badge para README:
-#   ![tests](https://github.com/parabolicas/pm25/actions/workflows/tests.yml/badge.svg)
+#   ![tests](https://github.com/parabolicas/pm25copia/actions/workflows/tests.yml/badge.svg)
 # =============================================================
 name: tests
 
