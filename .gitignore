@@ -53,3 +53,10 @@ BR_Municipios_2022/BR_Municipios_2022.prj
 BR_Municipios_2022/BR_Municipios_2022.shp
 BR_Municipios_2022/BR_Municipios_2022.shx
 .venv/
+base_clinica.csv
+matching_output/balanceamento_pos.csv
+matching_output/balanceamento_pre.csv
+matching_output/base_clinica_pareada_1_2.csv
+matching_output/diagnostico_pareamento.pdf
+matching_output/sensibilidade_nearest.csv
+matching_output/sumario_consort.txt
